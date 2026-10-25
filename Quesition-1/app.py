@@ -1,5 +1,5 @@
-import uuid
 import sqlite3
+import uuid
 from flask import Flask, Response, json, request
 
 app = Flask(__name__)
@@ -9,21 +9,20 @@ DB_NAME = "invoice_state.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Task store
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS tasks (
             task_id TEXT PRIMARY KEY,
-            invoice_id TEXT,
+            invoice_id TEXT UNIQUE,
             status TEXT NOT NULL,
-            action_taken TEXT NOT NULL,
+            action TEXT NOT NULL,
             evidence TEXT NOT NULL,
+            evidence_ids TEXT,
             receipt_id TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """
     )
-    # Receipts store
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS receipts (
@@ -43,7 +42,7 @@ init_db()
 
 
 def a2a_response(data, status_code=200):
-    """Returns JSON with the mandatory application/a2a+json header."""
+    """Returns JSON with mandatory application/a2a+json Content-Type."""
     return Response(
         response=json.dumps(data),
         status=status_code,
@@ -53,70 +52,175 @@ def a2a_response(data, status_code=200):
 
 
 def validate_a2a_request():
-    """Validates authentication, A2A version, and media types."""
-    # 1. Bearer Token Auth Check
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+    """Validates authentication, versioning, and strict media types."""
+    # 1. Bearer Auth Check
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
         return a2a_response(
-            {"error": "Unauthorized", "message": "Missing Bearer token"}, 401
+            {"error": "Unauthorized", "message": "Missing or invalid Bearer token"},
+            401,
         )
 
-    # 2. Protocol Version Check
+    # 2. Version Check
     version = request.headers.get("A2A-Version", "1.0")
     if version != "1.0":
         return a2a_response(
-            {"error": "Bad Request", "message": "Unsupported A2A-Version"}, 400
+            {"error": "Bad Request", "message": "Unsupported A2A version"}, 400
         )
 
-    # 3. Media Type Check for POST
+    # 3. Strict POST Content-Type Check
     if request.method == "POST":
         content_type = request.headers.get("Content-Type", "")
-        if "application/a2a+json" not in content_type and "application/json" not in content_type:
+        if "application/a2a+json" not in content_type:
             return a2a_response(
-                {"error": "Unsupported Media Type", "message": "Content-Type must be application/a2a+json"}, 415
+                {
+                    "error": "Unsupported Media Type",
+                    "message": "Content-Type must be application/a2a+json",
+                },
+                415,
             )
 
     return None
 
 
-# --- Agent Card Endpoint ---
+# --- AGENT CARD ENDPOINTS ---
 @app.route("/a2a/.well-known/agent-card.json", methods=["GET"])
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
-    card_data = {
-        "name": "A2A Invoice Agent",
-        "description": "Evidence-based invoice agent supporting safety and idempotency",
+    base_url = request.host_url.rstrip("/")
+    if not base_url.endswith("/a2a"):
+        base_url += "/a2a"
+
+    card = {
+        "name": "Invoice Agent",
+        "description": "Safe, evidence-based invoice agent for automated processing",
         "version": "1.0.0",
         "a2a_version": "1.0",
+        "url": base_url,
         "capabilities": {
             "streaming": False,
-            "push_notifications": False
+            "push_notifications": False,
         },
         "skills": [
             {
-                "id": "invoice-processor",
-                "name": "Invoice Processing Skill",
-                "description": "Evaluates invoices, checks approval limits, prevents duplicate payments",
-                "modes": ["sync"]
+                "id": "invoice-processing",
+                "name": "Invoice Processing",
+                "description": "Decide and act safely on invoices using supporting evidence",
+                "modes": ["sync"],
             }
         ],
         "endpoints": {
-            "message_send": "/message:send",
-            "tasks": "/tasks",
-            "receipts": "/receipts"
-        }
+            "message_send": f"{base_url}/message:send",
+            "tasks": f"{base_url}/tasks",
+            "receipts": f"{base_url}/receipts",
+        },
     }
-    return a2a_response(card_data)
+    return a2a_response(card)
 
 
-# --- Root / Health Check ---
+# --- HEALTH / ROOT ENDPOINTS ---
 @app.route("/", methods=["GET", "HEAD"])
 @app.route("/a2a/", methods=["GET", "HEAD"])
 def root():
     return a2a_response({"status": "running", "service": "A2A Invoice Agent"})
 
 
-# --- Message Processing Endpoint ---
+# --- CORE INVOICE DECISION LOGIC ---
+def evaluate_invoice(payload):
+    doc = payload.get("invoice", payload.get("document", payload))
+
+    invoice_id = doc.get("invoice_id") or doc.get("id") or f"INV-{uuid.uuid4().hex[:6]}"
+    amount = float(doc.get("amount", doc.get("total", 0.0)))
+    has_po = doc.get("has_po_match", doc.get("po_matched", False))
+    evidence_id = doc.get("evidence_id") or doc.get("po_number", "EVID-001")
+
+    # Idempotency / Duplicate Check
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT task_id, status, action, evidence, evidence_ids, receipt_id FROM tasks WHERE invoice_id = ?",
+        (invoice_id,),
+    )
+    existing = cursor.fetchone()
+
+    if existing:
+        conn.close()
+        return {
+            "task_id": existing[0],
+            "status": existing[1],
+            "action": existing[2],
+            "action_taken": existing[2],
+            "evidence": existing[3],
+            "evidence_cited": existing[3],
+            "evidence_ids": [existing[4]] if existing[4] else [],
+            "receipt_id": existing[5],
+            "message": "Duplicate payment blocked; returning existing state.",
+        }
+
+    # Business Rules Decision Engine
+    APPROVAL_LIMIT = 5000.0
+
+    if not has_po:
+        action = "REJECT"
+        evidence = f"Invoice {invoice_id} rejected: No matching Purchase Order found."
+    elif amount > APPROVAL_LIMIT:
+        action = "FLAG_FOR_APPROVAL"
+        evidence = f"Invoice {invoice_id} flagged: Amount ${amount:.2f} exceeds threshold limit of ${APPROVAL_LIMIT:.2f}."
+    else:
+        action = "PAY_INVOICE"
+        evidence = f"Invoice {invoice_id} approved: Supporting evidence {evidence_id} matches PO and amount ${amount:.2f} is within limit."
+
+    task_id = f"task_{uuid.uuid4().hex[:8]}"
+    receipt_id = f"rcpt_{uuid.uuid4().hex[:8]}" if action == "PAY_INVOICE" else None
+
+    # Persist State
+    cursor.execute(
+        """
+        INSERT INTO tasks (task_id, invoice_id, status, action, evidence, evidence_ids, receipt_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """,
+        (
+            task_id,
+            invoice_id,
+            "COMPLETED",
+            action,
+            evidence,
+            evidence_id,
+            receipt_id,
+        ),
+    )
+
+    if receipt_id:
+        cursor.execute(
+            """
+            INSERT INTO receipts (receipt_id, task_id, action, details)
+            VALUES (?, ?, ?, ?)
+        """,
+            (
+                receipt_id,
+                task_id,
+                action,
+                f"Paid ${amount:.2f} for {invoice_id} based on evidence {evidence_id}",
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "task_id": task_id,
+        "invoice_id": invoice_id,
+        "status": "COMPLETED",
+        "action": action,
+        "action_taken": action,
+        "evidence": evidence,
+        "evidence_cited": evidence,
+        "evidence_ids": [evidence_id],
+        "receipt_id": receipt_id,
+    }
+
+
+# --- MESSAGE SEND ENDPOINT ---
 @app.route("/a2a/message:send", methods=["POST"])
 @app.route("/message:send", methods=["POST"])
 def message_send():
@@ -125,71 +229,11 @@ def message_send():
         return err
 
     data = request.get_json(force=True, silent=True) or {}
-    payload = data.get("payload", data)
-
-    invoice_id = payload.get("invoice_id") or data.get("invoice_id", f"INV-{uuid.uuid4().hex[:6]}")
-    amount = float(payload.get("amount", data.get("amount", 0.0)))
-    has_po = payload.get("has_po_match", data.get("has_po_match", False))
-
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-
-    # Idempotency Check on invoice_id
-    cursor.execute("SELECT task_id, status, action_taken, evidence, receipt_id FROM tasks WHERE invoice_id = ?", (invoice_id,))
-    existing = cursor.fetchone()
-
-    if existing:
-        conn.close()
-        return a2a_response({
-            "task_id": existing[0],
-            "status": existing[1],
-            "action_taken": existing[2],
-            "evidence_cited": existing[3],
-            "receipt_id": existing[4],
-            "message": "Existing task record retrieved."
-        }, 200)
-
-    # Business Rules
-    APPROVAL_LIMIT = 5000.0
-    if not has_po:
-        action = "REJECT"
-        evidence = "Invoice rejected: No matching Purchase Order found."
-    elif amount > APPROVAL_LIMIT:
-        action = "FLAG_FOR_APPROVAL"
-        evidence = f"Invoice flagged: Amount ${amount:.2f} exceeds limit ${APPROVAL_LIMIT:.2f}."
-    else:
-        action = "PAY_INVOICE"
-        evidence = f"Invoice approved: Matched PO and amount ${amount:.2f} within limit."
-
-    task_id = f"task_{uuid.uuid4().hex[:8]}"
-    receipt_id = f"rcpt_{uuid.uuid4().hex[:8]}" if action == "PAY_INVOICE" else None
-
-    # Save Task State
-    cursor.execute(
-        "INSERT INTO tasks (task_id, invoice_id, status, action_taken, evidence, receipt_id) VALUES (?, ?, ?, ?, ?, ?)",
-        (task_id, invoice_id, "COMPLETED", action, evidence, receipt_id)
-    )
-
-    if receipt_id:
-        cursor.execute(
-            "INSERT INTO receipts (receipt_id, task_id, action, details) VALUES (?, ?, ?, ?)",
-            (receipt_id, task_id, action, f"Paid amount ${amount:.2f} for {invoice_id}")
-        )
-
-    conn.commit()
-    conn.close()
-
-    return a2a_response({
-        "task_id": task_id,
-        "invoice_id": invoice_id,
-        "status": "COMPLETED",
-        "action_taken": action,
-        "evidence_cited": evidence,
-        "receipt_id": receipt_id
-    }, 200)
+    result = evaluate_invoice(data.get("payload", data))
+    return a2a_response({"status": "success", "result": result})
 
 
-# --- Task Lifecycle Endpoints ---
+# --- TASK LIFECYCLE & READ ENDPOINTS ---
 @app.route("/a2a/tasks", methods=["GET"])
 @app.route("/tasks", methods=["GET"])
 def list_tasks():
@@ -199,7 +243,9 @@ def list_tasks():
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT task_id, invoice_id, status, action_taken, evidence, receipt_id FROM tasks")
+    cursor.execute(
+        "SELECT task_id, invoice_id, status, action, evidence, receipt_id FROM tasks"
+    )
     rows = cursor.fetchall()
     conn.close()
 
@@ -208,42 +254,59 @@ def list_tasks():
             "task_id": r[0],
             "invoice_id": r[1],
             "status": r[2],
-            "action_taken": r[3],
-            "evidence_cited": r[4],
-            "receipt_id": r[5]
+            "action": r[3],
+            "evidence": r[4],
+            "receipt_id": r[5],
         }
         for r in rows
     ]
     return a2a_response({"tasks": tasks})
 
 
-@app.route("/a2a/tasks/<task_id>", methods=["GET"])
-@app.route("/tasks/<task_id>", methods=["GET"])
-def get_task(task_id):
+@app.route("/a2a/tasks/<task_id>", methods=["GET", "POST", "DELETE"])
+@app.route("/tasks/<task_id>", methods=["GET", "POST", "DELETE"])
+def handle_task(task_id):
     err = validate_a2a_request()
     if err:
         return err
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT task_id, invoice_id, status, action_taken, evidence, receipt_id FROM tasks WHERE task_id = ?", (task_id,))
+
+    if request.method == "DELETE" or request.path.endswith("/cancel"):
+        cursor.execute(
+            "UPDATE tasks SET status = 'CANCELLED' WHERE task_id = ?",
+            (task_id,),
+        )
+        conn.commit()
+        conn.close()
+        return a2a_response(
+            {"task_id": task_id, "status": "CANCELLED", "action": "CANCELLED"}
+        )
+
+    cursor.execute(
+        "SELECT task_id, invoice_id, status, action, evidence, receipt_id FROM tasks WHERE task_id = ?",
+        (task_id,),
+    )
     r = cursor.fetchone()
     conn.close()
 
     if not r:
         return a2a_response({"error": "Task not found"}, 404)
 
-    return a2a_response({
-        "task_id": r[0],
-        "invoice_id": r[1],
-        "status": r[2],
-        "action_taken": r[3],
-        "evidence_cited": r[4],
-        "receipt_id": r[5]
-    })
+    return a2a_response(
+        {
+            "task_id": r[0],
+            "invoice_id": r[1],
+            "status": r[2],
+            "action": r[3],
+            "evidence": r[4],
+            "receipt_id": r[5],
+        }
+    )
 
 
-# --- Receipts Endpoint ---
+# --- RECEIPTS ENDPOINT ---
 @app.route("/a2a/receipts", methods=["GET"])
 @app.route("/receipts", methods=["GET"])
 def list_receipts():
@@ -253,7 +316,9 @@ def list_receipts():
 
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute("SELECT receipt_id, task_id, action, details, timestamp FROM receipts")
+    cursor.execute(
+        "SELECT receipt_id, task_id, action, details, timestamp FROM receipts"
+    )
     rows = cursor.fetchall()
     conn.close()
 
@@ -263,7 +328,7 @@ def list_receipts():
             "task_id": r[1],
             "action": r[2],
             "details": r[3],
-            "timestamp": r[4]
+            "timestamp": r[4],
         }
         for r in rows
     ]
