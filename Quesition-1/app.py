@@ -1,5 +1,5 @@
 import sqlite3
-from flask import Flask, jsonify, request
+from flask import Flask, Response, json, request
 
 app = Flask(__name__)
 DB_NAME = "invoice_state.db"
@@ -26,36 +26,40 @@ def init_db():
 init_db()
 
 
+def a2a_response(data, status_code=200):
+    """Helper function to return JSON with the required A2A media type."""
+    return Response(
+        response=json.dumps(data),
+        status=status_code,
+        mimetype="application/a2a+json",
+        headers={"Content-Type": "application/a2a+json"},
+    )
+
+
 # --- A2A Agent Card Endpoint ---
 @app.route("/a2a/.well-known/agent-card.json", methods=["GET"])
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
-    return (
-        jsonify(
-            {
-                "name": "Invoice Agent",
-                "description": "A2A compliant invoice agent",
-                "version": "1.0.0",
-                "a2a_version": "1.0",
-                "capabilities": ["message:send"],
-                "endpoints": {"message_send": "/message:send"},
-            }
-        ),
-        200,
-        {"Content-Type": "application/json"},
-    )
+    card_data = {
+        "name": "Invoice Agent",
+        "description": "A2A compliant invoice agent",
+        "version": "1.0.0",
+        "a2a_version": "1.0",
+        "capabilities": ["message:send"],
+        "endpoints": {"message_send": "/message:send"},
+    }
+    return a2a_response(card_data)
 
 
 # --- Root / Health Check Routes ---
 @app.route("/", methods=["GET", "HEAD"])
 @app.route("/a2a/", methods=["GET", "HEAD"])
 def root():
-    return jsonify({"status": "running"}), 200
+    return a2a_response({"status": "running"})
 
 
 # --- Core Logic Handler ---
 def process_invoice_logic(data):
-    # Extract invoice details directly or from nested A2A payload wrappers
     invoice_data = data.get("payload", data) if isinstance(data, dict) else {}
 
     invoice_id = invoice_data.get("invoice_id") or data.get("invoice_id")
@@ -63,7 +67,6 @@ def process_invoice_logic(data):
     has_po_match = invoice_data.get("has_po_match", data.get("has_po_match", False))
 
     if not invoice_id:
-        # Fallback default ID if wrapped differently in test harness
         invoice_id = data.get("id", "INV-UNKNOWN")
 
     # Idempotency Check
@@ -123,7 +126,7 @@ def process_invoice_logic(data):
 def a2a_message_send():
     data = request.get_json(force=True, silent=True) or {}
     result = process_invoice_logic(data)
-    return jsonify({"result": result, "status": "success"}), 200
+    return a2a_response({"result": result, "status": "success"})
 
 
 # --- Legacy / Generic Fallback Route ---
@@ -132,7 +135,7 @@ def a2a_message_send():
 def process_invoice():
     data = request.get_json(force=True, silent=True) or {}
     result = process_invoice_logic(data)
-    return jsonify(result), 200
+    return a2a_response(result)
 
 
 if __name__ == "__main__":
