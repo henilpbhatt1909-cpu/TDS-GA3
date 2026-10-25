@@ -1,7 +1,7 @@
 import os
 from flask import Flask, request, jsonify
 from database import init_db, save_telemetry, get_telemetry_history
-from triage import process_v2_incident
+from triage import process_v2_incident, redact_sensitive
 
 app = Flask(__name__)
 init_db()
@@ -14,18 +14,18 @@ def health_check():
 def incidents_v2_endpoint():
     data = request.get_json(silent=True)
     
-    # Return HTTP 400 for invalid/empty JSON payloads (Validation Probe requirement)
+    # Validation Probe: Return 400 on bad payload
     if data is None or not isinstance(data, dict):
         return jsonify({"error": "Invalid or missing JSON payload"}), 400
 
     try:
         response_data = process_v2_incident(data)
         
-        # Stored state for durability / replay requirements
+        # Save telemetry for replay checks
         save_telemetry(
             incident_id=response_data["incident_id"],
             action_taken=response_data["action"]["tool"],
-            scaling_limit_reached=response_data["proposal"]["root_cause"] == "max_scaling_limit_reached",
+            scaling_limit_reached=response_data["telemetry"]["scaling_limit_reached"],
             telemetry=response_data["telemetry"]
         )
         
@@ -36,7 +36,7 @@ def incidents_v2_endpoint():
 @app.route("/telemetry", methods=["GET"])
 def get_telemetry():
     records = get_telemetry_history()
-    return jsonify({"telemetry_history": records}), 200
+    return jsonify({"telemetry_history": redact_sensitive(records)}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
