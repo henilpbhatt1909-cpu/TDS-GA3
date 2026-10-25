@@ -6,7 +6,6 @@ DB_NAME = "invoice_state.db"
 
 
 def init_db():
-    """Initializes the persistent SQLite database table for idempotency."""
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
@@ -27,7 +26,41 @@ def init_db():
 init_db()
 
 
+# --- A2A Agent Card Specification Endpoint ---
+@app.route("/a2a/.well-known/agent-card.json", methods=["GET"])
+@app.route("/.well-known/agent-card.json", methods=["GET"])
+def agent_card():
+    return (
+        jsonify(
+            {
+                "name": "Invoice Agent",
+                "description": "Agent for deciding and acting safely on invoices",
+                "version": "1.0.0",
+                "a2a_version": "1.0",
+                "capabilities": {
+                    "invoice_processing": True,
+                    "idempotency": True,
+                },
+                "endpoints": {
+                    "process_invoice": "/process-invoice",
+                },
+            }
+        ),
+        200,
+        {"Content-Type": "application/json"},
+    )
+
+
+# --- Root route fallback ---
+@app.route("/", methods=["GET", "HEAD"])
+@app.route("/a2a/", methods=["GET", "HEAD"])
+def root():
+    return jsonify({"status": "running"}), 200
+
+
+# --- Invoice Processing Endpoint ---
 @app.route("/a2a/process-invoice", methods=["POST"])
+@app.route("/process-invoice", methods=["POST"])
 def process_invoice():
     data = request.get_json() or {}
 
@@ -38,7 +71,6 @@ def process_invoice():
     if not invoice_id:
         return jsonify({"error": "Missing invoice_id"}), 400
 
-    # 1. Idempotency Check: Prevent duplicate processing/payment
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
@@ -62,7 +94,6 @@ def process_invoice():
             200,
         )
 
-    # 2. Evidence & Approval Threshold Logic
     APPROVAL_LIMIT = 5000.0
 
     if not has_po_match:
@@ -75,7 +106,6 @@ def process_invoice():
         action = "PAY_INVOICE"
         evidence = f"Invoice approved: Matched PO and amount ${amount:.2f} within limit."
 
-    # 3. Store State in Database Before Responding
     cursor.execute(
         """
         INSERT INTO invoice_tasks (invoice_id, status, action_taken, evidence)
@@ -101,4 +131,4 @@ def process_invoice():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5000)
