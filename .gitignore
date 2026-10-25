@@ -2,3 +2,6 @@ venv/
 *.db
 __pycache__/
 .DS_Store
+instance/
+*.sqlite
+__pycache__/
