@@ -4,38 +4,38 @@ import json
 import hmac
 import hashlib
 import sqlite3
-from datetime import datetime, timezone
+import uuid
 
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-DB_NAME = os.environ.get("DB_PATH", "invoice_state.db")
-RECEIPT_SECRET = os.environ.get("RECEIPT_SECRET", "")
+DB_PATH = os.environ.get("DB_PATH", "mailroom_state.db")
+RECEIPT_SECRET = os.environ.get("MAILROOM_RECEIPT_SECRET", "")
 
 app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 
-# --------------------------------------------------
-# DATABASE AND PERSISTENT STATE
-# --------------------------------------------------
+# ============================================================
+# DATABASE
+# ============================================================
 
-def get_db():
-    conn = sqlite3.connect(DB_NAME, timeout=15)
+def connect_db():
+    conn = sqlite3.connect(DB_PATH, timeout=20)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout=15000")
+    conn.execute("PRAGMA busy_timeout = 20000")
     return conn
 
 
 def init_db():
-    with get_db() as conn:
-        conn.execute("PRAGMA journal_mode=WAL")
-
+    with connect_db() as conn:
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS tasks (
+            CREATE TABLE IF NOT EXISTS proposals (
                 call_id TEXT PRIMARY KEY,
-                invoice_id TEXT NOT NULL,
+                case_id TEXT NOT NULL,
                 input_digest TEXT NOT NULL,
+                proposal_id TEXT NOT NULL,
                 action TEXT NOT NULL,
                 arguments TEXT NOT NULL,
                 evidence TEXT NOT NULL,
@@ -47,44 +47,45 @@ def init_db():
         """)
 
         conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_invoice_id
-            ON tasks(invoice_id)
+            CREATE INDEX IF NOT EXISTS idx_proposals_case
+            ON proposals(case_id)
         """)
 
 
 init_db()
 
 
-# --------------------------------------------------
-# GENERAL HELPERS
-# --------------------------------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 
-def canonical_json(data):
+def canonical_json(value):
     return json.dumps(
-        data,
+        value,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False
     )
 
 
-def sha256_digest(data):
+def digest(value):
     return hashlib.sha256(
-        canonical_json(data).encode("utf-8")
+        canonical_json(value).encode("utf-8")
     ).hexdigest()
 
 
-def stable_id(prefix, *parts):
-    value = "|".join(str(part) for part in parts)
-    digest = hashlib.sha256(value.encode()).hexdigest()
-    return f"{prefix}_{digest[:20]}"
+def stable_id(prefix, *values):
+    raw = "|".join(str(v) for v in values)
+    return prefix + "_" + hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()[:24]
 
 
-def now():
+def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def error_response(code, message, status):
+def error(message, status=400, code="invalid_request"):
     return jsonify({
         "error": {
             "code": code,
@@ -93,42 +94,124 @@ def error_response(code, message, status):
     }), status
 
 
-# --------------------------------------------------
-# REQUEST PARSING
-# --------------------------------------------------
+# ============================================================
+# REQUEST NORMALIZATION
+# ============================================================
 
-def extract_invoice(data):
-    for key in (
-        "invoice",
-        "invoice_package",
-        "invoicePackage",
-        "dossier",
-        "payload"
-    ):
+def find_object(data, keys):
+    for key in keys:
         value = data.get(key)
-
         if isinstance(value, dict):
             return value
-
-    return data
-
-
-def extract_invoice_id(invoice):
-    for key in (
-        "invoice_id",
-        "invoiceId",
-        "id"
-    ):
-        value = invoice.get(key)
-
-        if isinstance(value, (str, int)) and str(value).strip():
-            return str(value).strip()
-
     return None
 
 
-def extract_action_catalog(data, invoice):
-    for source in (data, invoice):
+def normalize_request(data):
+    """
+    Accept common JSON envelope layouts without changing
+    the original case data.
+    """
+
+    params = data
+
+    if isinstance(data.get("params"), dict):
+        params = data["params"]
+
+    elif isinstance(data.get("request"), dict):
+        params = data["request"]
+
+    elif isinstance(data.get("message"), dict):
+        params = data["message"]
+
+    dossier = find_object(params, [
+        "dossier",
+        "case_file",
+        "caseFile",
+        "case",
+        "payload"
+    ])
+
+    if dossier is None:
+        dossier = find_object(data, [
+            "dossier",
+            "case_file",
+            "caseFile",
+            "case",
+            "payload"
+        ])
+
+    if dossier is None:
+        dossier = params
+
+    call_id = (
+        params.get("callId")
+        or params.get("call_id")
+        or params.get("id")
+        or data.get("callId")
+        or data.get("call_id")
+    )
+
+    if isinstance(call_id, (int, float)):
+        call_id = str(call_id)
+
+    case_id = (
+        dossier.get("case_id")
+        or dossier.get("caseId")
+        or dossier.get("id")
+        or params.get("case_id")
+        or params.get("caseId")
+    )
+
+    if isinstance(case_id, (int, float)):
+        case_id = str(case_id)
+
+    operation = (
+        params.get("operation")
+        or params.get("phase")
+        or params.get("method")
+        or params.get("actionType")
+        or data.get("operation")
+        or data.get("phase")
+        or ""
+    )
+
+    operation = str(operation).lower()
+
+    if operation.endswith(".propose"):
+        operation = "propose"
+
+    elif operation.endswith(".commit"):
+        operation = "commit"
+
+    elif operation.endswith(".get"):
+        operation = "get"
+
+    supplied_digest = (
+        params.get("inputDigest")
+        or params.get("input_digest")
+        or data.get("inputDigest")
+        or data.get("input_digest")
+    )
+
+    return {
+        "call_id": str(call_id).strip() if call_id is not None else "",
+        "case_id": str(case_id).strip() if case_id is not None else "",
+        "operation": operation,
+        "dossier": dossier,
+        "params": params,
+        "supplied_digest": supplied_digest
+    }
+
+
+# ============================================================
+# ACTION CATALOG
+# ============================================================
+
+def extract_catalog(data, normalized):
+    params = normalized["params"]
+    dossier = normalized["dossier"]
+
+    for source in (params, data, dossier):
         for key in (
             "actionCatalog",
             "action_catalog",
@@ -137,21 +220,24 @@ def extract_action_catalog(data, invoice):
             "actions",
             "tools"
         ):
-            value = source.get(key)
+            catalog = source.get(key)
 
-            if isinstance(value, (list, dict)) and value:
-                return value
+            if isinstance(catalog, (list, dict)) and catalog:
+                return catalog
 
     return []
 
 
-def get_action_names(catalog):
-    names = set()
+def catalog_names(catalog):
+    result = set()
 
-    if isinstance(catalog, list):
+    if isinstance(catalog, dict):
+        result.update(catalog.keys())
+
+    elif isinstance(catalog, list):
         for item in catalog:
             if isinstance(item, str):
-                names.add(item)
+                result.add(item)
 
             elif isinstance(item, dict):
                 name = (
@@ -161,20 +247,15 @@ def get_action_names(catalog):
                 )
 
                 if isinstance(name, str):
-                    names.add(name)
+                    result.add(name)
 
-    elif isinstance(catalog, dict):
-        names.update(catalog.keys())
-
-    return names
+    return result
 
 
-def get_action_schema(catalog, action):
+def get_action_definition(catalog, action):
     if isinstance(catalog, dict):
-        schema = catalog.get(action)
-
-        if isinstance(schema, dict):
-            return schema
+        value = catalog.get(action)
+        return value if isinstance(value, dict) else {}
 
     if isinstance(catalog, list):
         for item in catalog:
@@ -193,46 +274,83 @@ def get_action_schema(catalog, action):
     return {}
 
 
-# --------------------------------------------------
-# DOCUMENT EVIDENCE
-# --------------------------------------------------
+def validate_arguments(catalog, action, arguments):
+    if not isinstance(arguments, dict):
+        return False
 
-def extract_evidence_lines(value):
-    lines = []
+    definition = get_action_definition(catalog, action)
 
-    def walk(obj, path="$"):
-        if isinstance(obj, str):
-            for number, line in enumerate(obj.splitlines(), start=1):
+    schema = (
+        definition.get("inputSchema")
+        or definition.get("input_schema")
+        or definition.get("parameters")
+        or definition.get("arguments")
+        or definition.get("args")
+        or {}
+    )
+
+    if isinstance(schema, dict):
+        properties = schema.get("properties", schema)
+        required = schema.get("required", [])
+
+        if isinstance(properties, dict) and properties:
+            if not set(arguments).issubset(set(properties)):
+                return False
+
+        if isinstance(required, list):
+            if any(key not in arguments for key in required):
+                return False
+
+    return True
+
+
+# ============================================================
+# EVIDENCE EXTRACTION
+# ============================================================
+
+def extract_evidence(dossier):
+    """
+    Preserve the source paths and original text so that
+    proposals can cite actual source material.
+    """
+
+    result = []
+
+    def walk(value, path="$"):
+        if isinstance(value, str):
+            for line_number, line in enumerate(
+                value.splitlines(), start=1
+            ):
                 if line.strip():
-                    lines.append({
+                    result.append({
                         "source": path,
-                        "line": number,
+                        "line": line_number,
                         "text": line.strip()
                     })
 
-        elif isinstance(obj, dict):
-            for key, child in obj.items():
-                walk(child, f"{path}.{key}")
+        elif isinstance(value, dict):
+            for key, child in value.items():
+                walk(child, path + "." + str(key))
 
-        elif isinstance(obj, list):
-            for index, child in enumerate(obj):
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
                 walk(child, f"{path}[{index}]")
 
-    walk(value)
-    return lines
+    walk(dossier)
+    return result
 
 
-def validate_evidence(evidence, source_lines):
+def validate_evidence(evidence, available):
     if not isinstance(evidence, list) or not evidence:
         return False
 
-    available = {
+    available_set = {
         (
             item["source"],
             item["line"],
             item["text"]
         )
-        for item in source_lines
+        for item in available
     }
 
     for item in evidence:
@@ -252,69 +370,196 @@ def validate_evidence(evidence, source_lines):
         if not isinstance(text, str):
             return False
 
-        if (source, line, text) not in available:
+        if (source, line, text) not in available_set:
             return False
 
     return True
 
 
-# --------------------------------------------------
-# ACTION ARGUMENT VALIDATION
-# --------------------------------------------------
+# ============================================================
+# AUTHORITY AND CASE STATE
+# ============================================================
 
-def validate_arguments(catalog, action, arguments):
-    if not isinstance(arguments, dict):
-        return False
+def evaluate_case(dossier):
+    """
+    Extract factual state. Do not authorize forwarding merely
+    because a recipient or signature field exists.
+    """
 
-    schema = get_action_schema(catalog, action)
+    authority = (
+        dossier.get("approval_document")
+        or dossier.get("authority")
+        or dossier.get("authorization")
+        or {}
+    )
 
-    argument_schema = {}
-    required = schema.get("required", [])
+    if not isinstance(authority, dict):
+        authority = {}
 
-    for key in (
-        "arguments",
-        "args",
-        "parameters",
-        "inputSchema",
-        "input_schema"
+    recipient = (
+        dossier.get("recipient")
+        or dossier.get("intended_recipient")
+    )
+
+    authorized_recipient = (
+        authority.get("recipient")
+        or authority.get("approved_for")
+    )
+
+    authority_status = str(
+        authority.get("status", "UNKNOWN")
+    ).upper()
+
+    case_status = str(
+        dossier.get("status", "UNKNOWN")
+    ).upper()
+
+    evidence_id = (
+        authority.get("evidence_id")
+        or dossier.get("evidence_id")
+    )
+
+    problems = []
+
+    if not authority:
+        problems.append("missing_authority")
+
+    if authority_status in (
+        "EXPIRED",
+        "REVOKED",
+        "SUPERSEDED",
+        "INVALID"
     ):
-        value = schema.get(key)
+        problems.append("invalid_authority")
 
-        if isinstance(value, dict):
-            argument_schema = value.get(
-                "properties",
-                value
-            )
+    if not evidence_id:
+        problems.append("missing_provenance")
 
-            required = value.get("required", required)
-            break
+    if (
+        recipient
+        and authorized_recipient
+        and str(recipient).casefold()
+        != str(authorized_recipient).casefold()
+    ):
+        problems.append("recipient_mismatch")
 
-        if isinstance(value, list):
-            argument_schema = {
-                item.get("name") or item.get("key"): item
-                for item in value
-                if isinstance(item, dict)
-                and (item.get("name") or item.get("key"))
-            }
-            break
-
-    # If a schema defines argument keys, reject unknown keys.
-    if argument_schema:
-        if not set(arguments).issubset(set(argument_schema)):
-            return False
-
-    if isinstance(required, list):
-        if any(key not in arguments for key in required):
-            return False
-
-    return True
+    return {
+        "recipient": recipient,
+        "authorized_recipient": authorized_recipient,
+        "authority_status": authority_status,
+        "case_status": case_status,
+        "evidence_id": evidence_id,
+        "problems": problems
+    }
 
 
-# --------------------------------------------------
-# SIGNED RECEIPT VALIDATION
-# --------------------------------------------------
+# ============================================================
+# AI PROPOSAL
+# ============================================================
 
-def verify_signed_receipt(receipt, call_id, input_digest):
+def ask_ai(data, dossier, catalog, source_lines, state):
+    api_key = os.environ.get("OPENAI_API_KEY")
+
+    if not api_key:
+        return None
+
+    try:
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+
+        instructions = """
+You are a cautious mailroom decision agent.
+
+You must analyze the supplied dossier and select exactly one
+action from the supplied action catalog.
+
+Rules:
+- Use only exact action names in the catalog.
+- Use only argument keys allowed by that action's schema.
+- Never invent an ID, recipient, approval, authority document,
+  receipt, or source citation.
+- Consider authority, provenance, recipient matching, and
+  current case state.
+- An unsigned receipt is not proof of completion.
+- Do not infer authorization from action words alone.
+- Never perform an external side effect.
+- Cite every source line necessary to support the decision.
+- Do not include unrelated evidence.
+- Return exactly one proposal.
+
+Return JSON with this structure:
+{
+  "action": "exact catalog action",
+  "arguments": {},
+  "evidence": [
+    {
+      "source": "$.field",
+      "line": 1,
+      "text": "exact source line"
+    }
+  ],
+  "reason": "short factual explanation"
+}
+
+If the dossier is ambiguous or unsafe, choose the documented
+hold or reject action from the catalog when available.
+Never invent a fallback action.
+"""
+
+        prompt = {
+            "request": data,
+            "dossier": dossier,
+            "action_catalog": catalog,
+            "source_lines": source_lines,
+            "case_assessment": state
+        }
+
+        response = client.chat.completions.create(
+            model=os.environ.get(
+                "OPENAI_MODEL",
+                "gpt-4.1-mini"
+            ),
+            temperature=0,
+            response_format={"type": "json_object"},
+            messages=[
+                {
+                    "role": "system",
+                    "content": instructions
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        prompt,
+                        ensure_ascii=False,
+                        default=str
+                    )
+                }
+            ]
+        )
+
+        content = response.choices[0].message.content
+
+        if not content:
+            return None
+
+        result = json.loads(content)
+
+        if not isinstance(result, dict):
+            return None
+
+        return result
+
+    except Exception:
+        app.logger.exception("Proposal generation failed")
+        return None
+
+
+# ============================================================
+# SIGNED RECEIPTS
+# ============================================================
+
+def verify_receipt(receipt, call_id, input_digest):
     if not isinstance(receipt, dict):
         return None
 
@@ -322,6 +567,7 @@ def verify_signed_receipt(receipt, call_id, input_digest):
         return None
 
     signature = receipt.get("signature")
+
     receipt_id = (
         receipt.get("receiptId")
         or receipt.get("receipt_id")
@@ -336,8 +582,6 @@ def verify_signed_receipt(receipt, call_id, input_digest):
         receipt.get("inputDigest")
         or receipt.get("input_digest")
     )
-
-    status = str(receipt.get("status", "")).upper()
 
     if not all(
         isinstance(value, str) and value
@@ -356,178 +600,69 @@ def verify_signed_receipt(receipt, call_id, input_digest):
     if receipt_digest != input_digest:
         return None
 
-    if status not in (
-        "COMPLETED",
-        "COMMITTED",
-        "PAID",
-        "RECEIVED"
-    ):
-        return None
-
-    unsigned_receipt = {
+    unsigned = {
         key: value
         for key, value in receipt.items()
         if key != "signature"
     }
 
-    expected_signature = hmac.new(
+    expected = hmac.new(
         RECEIPT_SECRET.encode(),
-        canonical_json(unsigned_receipt).encode(),
+        canonical_json(unsigned).encode(),
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(
-        signature,
-        expected_signature
-    ):
+    if not hmac.compare_digest(signature, expected):
         return None
 
     return {
+        "receipt_id": receipt_id
+    }
+
+
+# ============================================================
+# RESPONSE ENVELOPE
+# ============================================================
+
+def proposal_response(
+    call_id,
+    input_digest,
+    proposal_id,
+    action,
+    arguments,
+    evidence,
+    status,
+    receipt_id=None,
+    reason=""
+):
+    return {
+        "callId": call_id,
+        "inputDigest": input_digest,
+        "status": status,
         "receipt_id": receipt_id,
-        "signature": signature
+        "proposals": [
+            {
+                "proposal_id": proposal_id,
+                "action": action,
+                "arguments": arguments,
+                "evidence": evidence,
+                "reason": reason,
+                "status": status
+            }
+        ]
     }
 
 
-# --------------------------------------------------
-# AI DECISION MAKING
-# --------------------------------------------------
-
-def ask_ai(data, invoice, catalog, source_lines):
-    api_key = os.environ.get("OPENAI_API_KEY")
-
-    if not api_key:
-        return None, "OPENAI_API_KEY is not configured"
-
-    try:
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-
-        prompt = {
-            "request": data,
-            "invoice": invoice,
-            "action_catalog": catalog,
-            "evidence_lines": source_lines
-        }
-
-        result = client.chat.completions.create(
-            model=os.environ.get(
-                "OPENAI_MODEL",
-                "gpt-4.1-mini"
-            ),
-            temperature=0,
-            response_format={"type": "json_object"},
-            messages=[
-                {
-                    "role": "system",
-                    "content": """
-You are an invoice decision agent.
-
-Analyze the invoice package and supporting documents.
-
-Rules:
-1. Use documentary evidence, authorization and invoice state.
-2. Never choose an action outside the supplied action catalog.
-3. Never invent invoice IDs, payment IDs or authorization.
-4. A payment for a different invoice is NOT a duplicate.
-5. A payment must not be repeated on a retry.
-6. Do not claim that a payment occurred without a valid receipt.
-7. Return exactly one proposal.
-8. Use only the documented argument keys for the chosen action.
-9. Cite the exact evidence lines supporting the decision.
-10. Do not perform external financial transactions.
-
-Return JSON:
-{
-  "action": "exact catalog action",
-  "arguments": {},
-  "evidence": [
-    {
-      "source": "$.field",
-      "line": 1,
-      "text": "exact source text"
-    }
-  ],
-  "reason": "brief explanation"
-}
-
-If no safe documented action can be selected,
-return action "__NO_SAFE_ACTION__".
-"""
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        prompt,
-                        ensure_ascii=False,
-                        default=str
-                    )
-                }
-            ]
-        )
-
-        answer = result.choices[0].message.content
-
-        return json.loads(answer), None
-
-    except Exception as exc:
-        return None, (
-            f"AI processing failed: {type(exc).__name__}"
-        )
-
-
-# --------------------------------------------------
-# PROPOSAL VALIDATION
-# --------------------------------------------------
-
-def validate_proposal(proposal, catalog, source_lines):
-    if not isinstance(proposal, dict):
-        return None
-
-    action = proposal.get("action")
-    arguments = proposal.get("arguments")
-    evidence = proposal.get("evidence")
-
-    if not isinstance(action, str) or not action:
-        return None
-
-    if action == "__NO_SAFE_ACTION__":
-        return None
-
-    if action not in get_action_names(catalog):
-        return None
-
-    if not validate_arguments(
-        catalog,
-        action,
-        arguments
-    ):
-        return None
-
-    if not validate_evidence(
-        evidence,
-        source_lines
-    ):
-        return None
-
-    return {
-        "action": action,
-        "arguments": arguments,
-        "evidence": evidence,
-        "reason": str(proposal.get("reason", ""))
-    }
-
-
-# --------------------------------------------------
-# HEALTH CHECK AND AGENT DISCOVERY
-# --------------------------------------------------
+# ============================================================
+# HEALTH AND AGENT CARD
+# ============================================================
 
 @app.get("/")
 @app.get("/health")
 def health():
     return jsonify({
-        "status": "ok",
-        "service": "Invoice Decision Agent"
+        "status": "running",
+        "service": "Safe AI Mailroom Agent"
     })
 
 
@@ -540,34 +675,31 @@ def agent_card():
     ).rstrip("/")
 
     return jsonify({
-        "name": "Invoice Decision Agent",
+        "name": "Safe AI Mailroom Agent",
         "description": (
-            "Evidence-based invoice decisions with "
-            "approval checks and retry protection."
+            "Evidence-based mailroom proposals with "
+            "authority checks and retry-safe state."
         ),
         "version": "1.0.0",
         "url": base_url,
         "capabilities": {
+            "authority_verification": True,
             "evidence_validation": True,
-            "idempotency": True,
-            "signed_receipt_validation": True
+            "signed_receipts": True,
+            "idempotency": True
         },
         "endpoints": {
-            "invoice_actions": (
-                f"{base_url}/v1/invoice/actions"
+            "mailroom_actions": (
+                f"{base_url}/v1/mailroom/actions"
             )
         }
     })
 
 
-# --------------------------------------------------
-# MAIN API
-# --------------------------------------------------
+# ============================================================
+# PROPOSE / COMMIT API
+# ============================================================
 
-@app.route(
-    "/v1/invoice/actions",
-    methods=["POST", "GET"]
-)
 @app.route(
     "/v1/mailroom/actions",
     methods=["POST", "GET"]
@@ -576,128 +708,141 @@ def agent_card():
     "/a2a/v1/mailroom/actions",
     methods=["POST", "GET"]
 )
-def invoice_actions():
+def mailroom_actions():
 
     if request.method == "GET":
-        with get_db() as conn:
+        with connect_db() as conn:
             rows = conn.execute("""
-                SELECT call_id, invoice_id, input_digest,
-                       action, status, created_at
-                FROM tasks
+                SELECT call_id, case_id, input_digest,
+                       proposal_id, action, status, receipt_id
+                FROM proposals
                 ORDER BY created_at DESC
                 LIMIT 100
             """).fetchall()
 
         return jsonify({
-            "tasks": [dict(row) for row in rows]
+            "actions": [dict(row) for row in rows]
         })
 
     if not request.is_json:
-        return error_response(
-            "invalid_content_type",
-            "Content-Type must be application/json",
-            415
+        return error(
+            "Expected application/json",
+            415,
+            "invalid_content_type"
         )
 
     data = request.get_json(silent=True)
 
     if not isinstance(data, dict):
-        return error_response(
-            "malformed_request",
-            "Expected a valid JSON object",
-            400
+        return error(
+            "Request must be a JSON object",
+            400,
+            "malformed_request"
         )
 
-    call_id = (
-        data.get("callId")
-        or data.get("call_id")
-    )
+    normalized = normalize_request(data)
 
-    if not isinstance(call_id, str) or not call_id.strip():
-        return error_response(
-            "missing_call_id",
-            "A stable callId is required",
-            400
+    call_id = normalized["call_id"]
+    case_id = normalized["case_id"]
+    operation = normalized["operation"]
+    dossier = normalized["dossier"]
+
+    if not call_id:
+        return error(
+            "Missing callId",
+            400,
+            "missing_call_id"
         )
 
-    call_id = call_id.strip()
-
-    invoice = extract_invoice(data)
-
-    invoice_id = extract_invoice_id(invoice)
-
-    if not invoice_id:
-        return error_response(
-            "missing_invoice_id",
-            "A real invoice ID is required",
-            400
+    if not case_id:
+        return error(
+            "Missing case ID",
+            400,
+            "missing_case_id"
         )
 
-    catalog = extract_action_catalog(
-        data,
-        invoice
-    )
+    catalog = extract_catalog(data, normalized)
 
     if not catalog:
-        return error_response(
-            "missing_action_catalog",
-            "No documented action catalog was supplied",
-            422
+        return error(
+            "Missing documented action catalog",
+            422,
+            "missing_action_catalog"
         )
 
     input_data = {
-        "invoice": invoice,
+        "case_id": case_id,
+        "dossier": dossier,
         "action_catalog": catalog
     }
 
-    input_digest = sha256_digest(input_data)
+    input_digest = digest(input_data)
 
-    supplied_digest = (
-        data.get("inputDigest")
-        or data.get("input_digest")
-    )
+    supplied_digest = normalized["supplied_digest"]
 
     if (
         supplied_digest is not None
         and supplied_digest != input_digest
     ):
-        return error_response(
-            "digest_mismatch",
-            "inputDigest does not match request input",
-            409
+        return error(
+            "inputDigest does not match the request",
+            409,
+            "digest_mismatch"
         )
 
-    receipt = verify_signed_receipt(
-        data.get("signedReceipt")
-        or data.get("signed_receipt")
-        or data.get("receipt"),
+    proposal_id = stable_id(
+        "prop",
         call_id,
         input_digest
     )
 
-    # Check existing task before considering any new action.
-    with get_db() as conn:
+    receipt = verify_receipt(
+        (
+            normalized["params"].get("signedReceipt")
+            or normalized["params"].get("receipt")
+            or data.get("signedReceipt")
+            or data.get("receipt")
+        ),
+        call_id,
+        input_digest
+    )
+
+    with connect_db() as conn:
 
         existing = conn.execute(
-            "SELECT * FROM tasks WHERE call_id = ?",
+            "SELECT * FROM proposals WHERE call_id = ?",
             (call_id,)
         ).fetchone()
 
+        # Identical retry: reuse the stored result.
         if existing:
 
             if (
-                existing["input_digest"] != input_digest
-                or existing["invoice_id"] != invoice_id
+                existing["case_id"] != case_id
+                or existing["input_digest"] != input_digest
             ):
-                return error_response(
-                    "call_id_conflict",
-                    "The callId was reused with different input",
-                    409
+                return error(
+                    "callId reused with different input",
+                    409,
+                    "call_id_conflict"
                 )
 
-            if receipt and existing["status"] != "COMPLETED":
+            if operation == "commit":
+
+                if existing["status"] == "COMPLETED":
+                    return jsonify(
+                        json.loads(existing["response"])
+                    )
+
+                if not receipt:
+                    return error(
+                        "A valid signed receipt is required",
+                        403,
+                        "invalid_receipt"
+                    )
+
                 conn.execute("""
-                    UPDATE tasks
+                    UPDATE proposals
                     SET status = 'COMPLETED',
                         receipt_id = ?
                     WHERE call_id = ?
@@ -706,22 +851,15 @@ def invoice_actions():
                     call_id
                 ))
 
-                response = json.loads(
-                    existing["response"]
-                )
-
+                response = json.loads(existing["response"])
                 response["status"] = "COMPLETED"
-                response["receipt_id"] = (
-                    receipt["receipt_id"]
-                )
+                response["receipt_id"] = receipt["receipt_id"]
 
-                for proposal in response.get(
-                    "proposals", []
-                ):
-                    proposal["status"] = "COMPLETED"
+                for item in response.get("proposals", []):
+                    item["status"] = "COMPLETED"
 
                 conn.execute("""
-                    UPDATE tasks
+                    UPDATE proposals
                     SET response = ?
                     WHERE call_id = ?
                 """, (
@@ -735,158 +873,144 @@ def invoice_actions():
                 json.loads(existing["response"])
             )
 
-        # Different call IDs must not create duplicate
-        # proposals for the same invoice with changed input.
-        previous = conn.execute(
-            "SELECT input_digest FROM tasks "
-            "WHERE invoice_id = ? LIMIT 1",
-            (invoice_id,)
-        ).fetchone()
+        # Different call IDs cannot silently replace an
+        # existing proposal for the same case.
+        previous = conn.execute("""
+            SELECT call_id, input_digest
+            FROM proposals
+            WHERE case_id = ?
+            LIMIT 1
+        """, (case_id,)).fetchone()
 
-        if previous and previous["input_digest"] != input_digest:
-            return error_response(
-                "invoice_conflict",
-                "This invoice already has a proposal "
-                "with different input",
-                409
+        if previous:
+            return error(
+                "A proposal already exists for this case",
+                409,
+                "case_conflict"
             )
 
-        # Do not assume a payment was made merely because
-        # a receipt field or boolean is present.
-        source_lines = extract_evidence_lines(
-            invoice
-        )
+        # A commit must not create a fresh proposal.
+        if operation == "commit":
+            return error(
+                "No existing proposal is available to commit",
+                409,
+                "proposal_not_found"
+            )
 
-        proposal, ai_error = ask_ai(
+        source_lines = extract_evidence(dossier)
+        state = evaluate_case(dossier)
+
+        proposal = ask_ai(
             data,
-            invoice,
+            dossier,
             catalog,
-            source_lines
+            source_lines,
+            state
         )
 
         if proposal is None:
-            return error_response(
-                "decision_failed",
-                ai_error or "No safe decision available",
-                422
+            return error(
+                "Could not safely generate a proposal",
+                422,
+                "decision_failed"
             )
 
-        valid = validate_proposal(
-            proposal,
+        action = proposal.get("action")
+        arguments = proposal.get("arguments")
+        evidence = proposal.get("evidence")
+
+        if not isinstance(action, str):
+            return error(
+                "Proposal action must be a string",
+                422,
+                "invalid_action"
+            )
+
+        if action not in catalog_names(catalog):
+            return error(
+                "Action is not in the documented catalog",
+                422,
+                "unsupported_action"
+            )
+
+        if not validate_arguments(
             catalog,
+            action,
+            arguments
+        ):
+            return error(
+                "Action arguments do not match the schema",
+                422,
+                "invalid_arguments"
+            )
+
+        if not validate_evidence(
+            evidence,
             source_lines
-        )
-
-        if valid is None:
-            return error_response(
-                "invalid_proposal",
-                "Action, arguments, or evidence failed validation",
-                422
+        ):
+            return error(
+                "Evidence citations are invalid",
+                422,
+                "invalid_evidence"
             )
 
-        proposal_id = stable_id(
-            "proposal",
+        status = "PROPOSED"
+
+        response = proposal_response(
+            call_id=call_id,
+            input_digest=input_digest,
+            proposal_id=proposal_id,
+            action=action,
+            arguments=arguments,
+            evidence=evidence,
+            status=status,
+            reason=str(proposal.get("reason", ""))
+        )
+
+        conn.execute("""
+            INSERT INTO proposals (
+                call_id, case_id, input_digest, proposal_id,
+                action, arguments, evidence, status,
+                response, receipt_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
             call_id,
-            input_digest
-        )
+            case_id,
+            input_digest,
+            proposal_id,
+            action,
+            canonical_json(arguments),
+            canonical_json(evidence),
+            status,
+            canonical_json(response),
+            None,
+            utc_now()
+        ))
 
-        status = (
-            "COMPLETED"
-            if receipt
-            else "PROPOSED"
-        )
-
-        response = {
-            "callId": call_id,
-            "inputDigest": input_digest,
-            "status": status,
-            "receipt_id": (
-                receipt["receipt_id"]
-                if receipt else None
-            ),
-            "proposals": [
-                {
-                    "proposal_id": proposal_id,
-                    "action": valid["action"],
-                    "arguments": valid["arguments"],
-                    "evidence": valid["evidence"],
-                    "reason": valid["reason"],
-                    "status": status
-                }
-            ]
-        }
-
-        try:
-            conn.execute("""
-                INSERT INTO tasks (
-                    call_id,
-                    invoice_id,
-                    input_digest,
-                    action,
-                    arguments,
-                    evidence,
-                    status,
-                    response,
-                    receipt_id,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                call_id,
-                invoice_id,
-                input_digest,
-                valid["action"],
-                canonical_json(valid["arguments"]),
-                canonical_json(valid["evidence"]),
-                status,
-                canonical_json(response),
-                receipt["receipt_id"] if receipt else None,
-                now()
-            ))
-
-        except sqlite3.IntegrityError:
-            existing = conn.execute(
-                "SELECT * FROM tasks WHERE call_id = ?",
-                (call_id,)
-            ).fetchone()
-
-            if (
-                existing
-                and existing["input_digest"] == input_digest
-            ):
-                return jsonify(
-                    json.loads(existing["response"])
-                )
-
-            return error_response(
-                "state_conflict",
-                "Concurrent request conflict; retry "
-                "with the same callId and input",
-                409
-            )
-
-        return jsonify(response)
+        return jsonify(response), 200
 
 
-# --------------------------------------------------
-# ERROR HANDLING
-# --------------------------------------------------
+# ============================================================
+# ERROR HANDLERS
+# ============================================================
 
 @app.errorhandler(413)
-def request_too_large(_error):
-    return error_response(
-        "request_too_large",
-        "Request body exceeds the size limit",
-        413
+def too_large(_error):
+    return error(
+        "Request body too large",
+        413,
+        "request_too_large"
     )
 
 
 @app.errorhandler(500)
-def internal_error(_error):
-    return error_response(
-        "internal_error",
+def server_error(_error):
+    app.logger.exception("Unhandled server error")
+    return error(
         "Internal server error",
-        500
+        500,
+        "internal_error"
     )
 
 
