@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import uuid
 from flask import Flask, Response, json, request
@@ -11,14 +12,15 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute(
         """
-        CREATE TABLE IF NOT EXISTS mail_actions (
-            action_id TEXT PRIMARY KEY,
-            case_id TEXT UNIQUE,
-            recipient TEXT NOT NULL,
-            status TEXT NOT NULL,
-            action_taken TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS proposals (
+            call_id TEXT PRIMARY KEY,
+            case_id TEXT NOT NULL,
+            input_digest TEXT NOT NULL,
+            action TEXT NOT NULL,
+            args TEXT NOT NULL,
             evidence TEXT NOT NULL,
-            receipt_signed INTEGER DEFAULT 0,
+            status TEXT NOT NULL,
+            receipt_id TEXT,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """
@@ -31,7 +33,6 @@ init_db()
 
 
 def make_json_response(data, status_code=200):
-    """Utility to return JSON response with both standard application/json and application/a2a+json headers."""
     return Response(
         response=json.dumps(data),
         status=status_code,
@@ -40,14 +41,20 @@ def make_json_response(data, status_code=200):
     )
 
 
+def compute_digest(data):
+    """Computes SHA-256 inputDigest of the input payload."""
+    raw = json.dumps(data, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 # --- AGENT CARD DISCOVERY ENDPOINT ---
 @app.route("/a2a/.well-known/agent-card.json", methods=["GET"])
 @app.route("/.well-known/agent-card.json", methods=["GET"])
 def agent_card():
     base_url = request.host_url.rstrip("/")
     card = {
-        "name": "Safe Mailroom Agent",
-        "description": "Checks recipient authority and signed receipts before completing mailroom actions",
+        "name": "Safe AI Mailroom Agent",
+        "description": "Checks recipient authority, scope, and signed receipts before committing mailroom actions",
         "version": "1.0.0",
         "a2a_version": "1.0",
         "url": base_url,
@@ -55,14 +62,6 @@ def agent_card():
             "authority_verification": True,
             "signed_receipts": True,
         },
-        "skills": [
-            {
-                "id": "mailroom-handler",
-                "name": "Mailroom Authority Processor",
-                "description": "Verifies scope, recipient authority, and signed receipt verification",
-                "modes": ["sync", "async"],
-            }
-        ],
         "endpoints": {
             "mailroom_actions": f"{base_url}/v1/mailroom/actions",
             "message_send": f"{base_url}/message:send",
@@ -78,94 +77,146 @@ def root():
     return make_json_response({"status": "running", "service": "Safe AI Mailroom Agent"})
 
 
-# --- CORE MAILROOM AUTHORITY LOGIC ---
-def evaluate_mailroom_case(data):
-    case = data.get("payload", data) if isinstance(data, dict) else {}
-    case_file = case.get("case_file", case)
+# --- CORE MAILROOM EVALUATION LOGIC ---
+def process_mailroom_proposal(data):
+    call_id = data.get("callId") or data.get("call_id") or f"call_{uuid.uuid4().hex[:8]}"
+    dossier = data.get("dossier") or data.get("case_file") or data.get("payload") or data
+    input_digest = data.get("inputDigest") or compute_digest(dossier)
 
-    case_id = case_file.get("case_id") or case_file.get("id") or data.get("case_id") or f"CASE-{uuid.uuid4().hex[:6]}"
-    target_recipient = case_file.get("recipient") or case_file.get("intended_recipient") or "Default Recipient"
-    approval_doc = case_file.get("approval_document", {}) or case_file.get("approval", {})
+    case_id = dossier.get("case_id") or dossier.get("id") or f"CASE-{uuid.uuid4().hex[:6]}"
+    target_recipient = dossier.get("recipient") or dossier.get("intended_recipient") or "Unknown"
+    approval_doc = dossier.get("approval_document") or dossier.get("authority") or {}
 
     approved_recipient = approval_doc.get("recipient") or approval_doc.get("approved_for")
     doc_status = str(approval_doc.get("status", "ACTIVE")).upper()
-    is_signed = case_file.get("is_signed", False) or approval_doc.get("signed", False)
-    evidence_id = approval_doc.get("evidence_id") or case_file.get("evidence_id", "EVID-DOC-001")
+    signed_receipt = dossier.get("signed_receipt") or dossier.get("receipt") or dossier.get("is_signed", False)
+    evidence_id = approval_doc.get("evidence_id") or dossier.get("evidence_id") or "EVID-001"
 
-    # Idempotency / Deduplication Check
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
+
+    # Replay / Idempotency check on call_id or case_id
     cursor.execute(
-        "SELECT action_id, status, action_taken, evidence, receipt_signed FROM mail_actions WHERE case_id = ?",
-        (case_id,),
+        "SELECT call_id, case_id, input_digest, action, args, evidence, status, receipt_id FROM proposals WHERE call_id = ? OR case_id = ?",
+        (call_id, case_id),
     )
     existing = cursor.fetchone()
 
     if existing:
+        # Check conflict if same case_id has different input digest
+        if existing[1] == case_id and existing[2] != input_digest and not signed_receipt:
+            conn.close()
+            return {
+                "error": "Conflict",
+                "message": "Conflicting proposal for existing case_id",
+            }, 409
+
+        # Handle Receipt Commit / Continuation
+        if signed_receipt and existing[6] != "COMPLETED":
+            receipt_id = f"rcpt_{uuid.uuid4().hex[:8]}"
+            cursor.execute(
+                "UPDATE proposals SET status = 'COMPLETED', receipt_id = ? WHERE case_id = ?",
+                (receipt_id, case_id),
+            )
+            conn.commit()
+            conn.close()
+
+            return {
+                "callId": call_id,
+                "inputDigest": input_digest,
+                "status": "COMPLETED",
+                "receipt_id": receipt_id,
+                "proposals": [
+                    {
+                        "proposal_id": f"prop_{uuid.uuid4().hex[:6]}",
+                        "action": existing[3],
+                        "arguments": json.loads(existing[4]),
+                        "evidence": [existing[5]],
+                        "status": "COMPLETED",
+                    }
+                ],
+            }, 200
+
         conn.close()
         return {
-            "action_id": existing[0],
-            "case_id": case_id,
-            "status": existing[1],
-            "action": existing[2],
-            "action_taken": existing[2],
-            "evidence": existing[3],
-            "evidence_cited": existing[3],
-            "evidence_ids": [evidence_id],
-            "receipt_signed": bool(existing[4]),
-            "message": "Case retrieved from persistent state.",
-        }
+            "callId": existing[0],
+            "inputDigest": existing[2],
+            "status": existing[6],
+            "receipt_id": existing[7],
+            "proposals": [
+                {
+                    "proposal_id": f"prop_{uuid.uuid4().hex[:6]}",
+                    "action": existing[3],
+                    "arguments": json.loads(existing[4]),
+                    "evidence": [existing[5]],
+                    "status": existing[6],
+                }
+            ],
+        }, 200
 
-    # Authority and Scope Validation Rules
-    if not approval_doc and not case_file.get("has_authority", True):
+    # Business Rules
+    if not approval_doc and not dossier.get("has_authority", True):
         action = "REJECT_UNAUTHORIZED"
-        evidence = f"Case {case_id} rejected: Missing required approval document authority."
+        evidence_str = f"Line 1: Missing required authority document for case {case_id}."
     elif doc_status in ["EXPIRED", "REVOKED", "SUPERSEDED", "OLD"]:
         action = "REJECT_EXPIRED_AUTHORITY"
-        evidence = f"Case {case_id} rejected: Approval document status is '{doc_status}'."
+        evidence_str = f"Line 1: Authority document status '{doc_status}' is no longer valid."
     elif target_recipient and approved_recipient and str(target_recipient).lower() != str(approved_recipient).lower():
         action = "REJECT_MISMATCHED_RECIPIENT"
-        evidence = f"Case {case_id} rejected: Approval for '{approved_recipient}' does not match target recipient '{target_recipient}'."
-    elif not is_signed:
+        evidence_str = f"Line 1: Target recipient '{target_recipient}' does not match authorized recipient '{approved_recipient}'."
+    elif not signed_receipt:
         action = "HOLD_PENDING_SIGNATURE"
-        evidence = f"Case {case_id} held: Requires signed receipt before recording action as completed."
+        evidence_str = f"Line 1: Valid authority {evidence_id} exists for '{target_recipient}' but requires signed receipt."
     else:
         action = "FORWARD_AND_COMPLETE"
-        evidence = f"Case {case_id} completed: Valid active authorization {evidence_id} matches recipient '{target_recipient}' with signed receipt."
+        evidence_str = f"Line 1: Active authority {evidence_id} matched target recipient '{target_recipient}' with valid signed receipt."
 
-    action_id = f"act_{uuid.uuid4().hex[:8]}"
-    status = "COMPLETED" if action == "FORWARD_AND_COMPLETE" else "PROPOSED"
+    action_args = {
+        "case_id": case_id,
+        "recipient": target_recipient,
+        "evidence_id": evidence_id,
+    }
+
+    status = "COMPLETED" if (action == "FORWARD_AND_COMPLETE" or signed_receipt) else "PROPOSED"
+    receipt_id = f"rcpt_{uuid.uuid4().hex[:8]}" if status == "COMPLETED" else None
 
     cursor.execute(
         """
-        INSERT INTO mail_actions (action_id, case_id, recipient, status, action_taken, evidence, receipt_signed)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO proposals (call_id, case_id, input_digest, action, args, evidence, status, receipt_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """,
         (
-            action_id,
+            call_id,
             case_id,
-            str(target_recipient),
-            status,
+            input_digest,
             action,
-            evidence,
-            1 if is_signed else 0,
+            json.dumps(action_args),
+            evidence_str,
+            status,
+            receipt_id,
         ),
     )
 
     conn.commit()
     conn.close()
 
-    return {
-        "action_id": action_id,
-        "case_id": case_id,
+    response_payload = {
+        "callId": call_id,
+        "inputDigest": input_digest,
         "status": status,
-        "action": action,
-        "action_taken": action,
-        "evidence": evidence,
-        "evidence_cited": evidence,
-        "evidence_ids": [evidence_id],
-        "receipt_signed": is_signed,
+        "receipt_id": receipt_id,
+        "proposals": [
+            {
+                "proposal_id": f"prop_{uuid.uuid4().hex[:6]}",
+                "action": action,
+                "arguments": action_args,
+                "evidence": [evidence_str],
+                "status": status,
+            }
+        ],
     }
+
+    return response_payload, 200
 
 
 # --- PRIMARY MAILROOM ACTIONS ENDPOINT ---
@@ -175,38 +226,29 @@ def mailroom_actions():
     if request.method == "GET":
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
-        cursor.execute("SELECT action_id, case_id, status, action_taken, evidence FROM mail_actions")
+        cursor.execute("SELECT call_id, case_id, status, action, evidence FROM proposals")
         rows = cursor.fetchall()
         conn.close()
-        actions = [
-            {"action_id": r[0], "case_id": r[1], "status": r[2], "action": r[3], "evidence": r[4]}
-            for r in rows
-        ]
-        return make_json_response({"actions": actions})
+        return make_json_response({"actions": rows})
 
-    data = request.get_json(force=True, silent=True) or {}
-    result = evaluate_mailroom_case(data)
-    
-    # Return directly inside proposal envelope
-    return make_json_response({
-        "status": "success",
-        "action_id": result["action_id"],
-        "case_id": result["case_id"],
-        "action": result["action"],
-        "evidence": result["evidence"],
-        "evidence_cited": result["evidence_cited"],
-        "evidence_ids": result["evidence_ids"],
-        "result": result
-    }, 200)
+    data = request.get_json(force=True, silent=True)
+    if not data or not isinstance(data, dict):
+        return make_json_response({"error": "Malformed request payload"}, 400)
+
+    result, status_code = process_mailroom_proposal(data)
+    return make_json_response(result, status_code)
 
 
 # --- GENERIC MESSAGE DISPATCH ENDPOINT ---
 @app.route("/message:send", methods=["POST"])
 @app.route("/a2a/message:send", methods=["POST"])
 def message_send():
-    data = request.get_json(force=True, silent=True) or {}
-    result = evaluate_mailroom_case(data)
-    return make_json_response({"status": "success", "result": result}, 200)
+    data = request.get_json(force=True, silent=True)
+    if not data or not isinstance(data, dict):
+        return make_json_response({"error": "Malformed request payload"}, 400)
+
+    result, status_code = process_mailroom_proposal(data)
+    return make_json_response(result, status_code)
 
 
 if __name__ == "__main__":
