@@ -143,13 +143,25 @@ def normalize_request(data):
     if dossier is None:
         dossier = params
 
+
     call_id = (
         params.get("callId")
         or params.get("call_id")
         or params.get("id")
+        or params.get("taskId")
+        or params.get("task_id")
         or data.get("callId")
         or data.get("call_id")
+        or data.get("id")
+        or data.get("taskId")
+        or data.get("task_id")
     )
+
+    if isinstance(call_id, (int, float)):
+        call_id = str(call_id)
+
+    if call_id is None:
+        call_id = ""
 
     if isinstance(call_id, (int, float)):
         call_id = str(call_id)
