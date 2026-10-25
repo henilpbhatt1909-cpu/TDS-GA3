@@ -14,14 +14,16 @@ def health_check():
 def incidents_v2_endpoint():
     data = request.get_json(silent=True)
     
-    # Validation Probe: Return 400 on bad payload
+    # Validation probe check: return HTTP 400 for bad/empty JSON payloads
     if data is None or not isinstance(data, dict):
         return jsonify({"error": "Invalid or missing JSON payload"}), 400
 
     try:
-        response_data = process_v2_incident(data)
+        # Scrub incoming headers or body data
+        cleaned_payload = redact_sensitive(data)
+        response_data = process_v2_incident(cleaned_payload)
         
-        # Save telemetry for replay checks
+        # Save telemetry for state storage & durability replay tests
         save_telemetry(
             incident_id=response_data["incident_id"],
             action_taken=response_data["action"]["tool"],
