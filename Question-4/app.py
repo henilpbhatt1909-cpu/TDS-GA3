@@ -12,18 +12,20 @@ def health_check():
 
 @app.route("/v2/incidents", methods=["POST"])
 def incidents_v2_endpoint():
+    # Enforce JSON content type check & presence of payload body
+    if not request.is_json:
+        return jsonify({"error": "Content-Type must be application/json"}), 400
+
     data = request.get_json(silent=True)
     
-    # Validation probe check: return HTTP 400 for bad/empty JSON payloads
-    if data is None or not isinstance(data, dict):
-        return jsonify({"error": "Invalid or missing JSON payload"}), 400
+    # Validation Probe requirement: Return 400 if payload is empty, invalid, or missing required keys
+    if not data or not isinstance(data, dict) or len(data) == 0:
+        return jsonify({"error": "Invalid, empty, or missing JSON payload"}), 400
 
     try:
-        # Scrub incoming headers or body data
         cleaned_payload = redact_sensitive(data)
         response_data = process_v2_incident(cleaned_payload)
         
-        # Save telemetry for state storage & durability replay tests
         save_telemetry(
             incident_id=response_data["incident_id"],
             action_taken=response_data["action"]["tool"],
