@@ -1,39 +1,37 @@
 import os
 from flask import Flask, request, jsonify
 from database import init_db, save_telemetry, get_telemetry_history
-from triage import diagnose_and_triage
+from triage import process_v2_incident
 
 app = Flask(__name__)
-
-# Initialize DB when server starts
 init_db()
 
 @app.route("/", methods=["GET"])
 def health_check():
     return jsonify({"status": "healthy", "service": "incident-agent"}), 200
 
-@app.route("/triage", methods=["POST"])
-def triage_endpoint():
-    data = request.get_json() or {}
+@app.route("/v2/incidents", methods=["POST"])
+def incidents_v2_endpoint():
+    data = request.get_json(silent=True)
     
-    # 1. Run triage rules
-    result = diagnose_and_triage(data)
-    
-    # 2. Log telemetry to audit store
-    save_telemetry(
-        incident_id=result["telemetry"]["incident_id"],
-        action_taken=result["action"],
-        scaling_limit_reached=result["at_limit"],
-        telemetry=result["telemetry"]
-    )
-    
-    # 3. Return JSON output
-    return jsonify({
-        "status": "success",
-        "decision": result["action"],
-        "scaling_limit_reached": result["at_limit"],
-        "telemetry": result["telemetry"]
-    }), 200
+    # Return HTTP 400 for invalid/empty JSON payloads (Validation Probe requirement)
+    if data is None or not isinstance(data, dict):
+        return jsonify({"error": "Invalid or missing JSON payload"}), 400
+
+    try:
+        response_data = process_v2_incident(data)
+        
+        # Stored state for durability / replay requirements
+        save_telemetry(
+            incident_id=response_data["incident_id"],
+            action_taken=response_data["action"]["tool"],
+            scaling_limit_reached=response_data["proposal"]["root_cause"] == "max_scaling_limit_reached",
+            telemetry=response_data["telemetry"]
+        )
+        
+        return jsonify(response_data), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 422
 
 @app.route("/telemetry", methods=["GET"])
 def get_telemetry():
