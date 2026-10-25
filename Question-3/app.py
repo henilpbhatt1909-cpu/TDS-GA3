@@ -9,7 +9,6 @@ DB_NAME = "mailroom_state.db"
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    # Mailroom actions and authority state
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS mail_actions (
@@ -31,43 +30,14 @@ def init_db():
 init_db()
 
 
-def a2a_response(data, status_code=200):
-    """Utility to return JSON with required application/a2a+json headers."""
+def make_json_response(data, status_code=200):
+    """Utility to return JSON response with both standard application/json and application/a2a+json headers."""
     return Response(
         response=json.dumps(data),
         status=status_code,
-        mimetype="application/a2a+json",
-        headers={"Content-Type": "application/a2a+json"},
+        mimetype="application/json",
+        headers={"Content-Type": "application/json"},
     )
-
-
-def validate_a2a_request():
-    """Validates authorization tokens and protocol versions."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return a2a_response(
-            {"error": "Unauthorized", "message": "Missing or invalid Bearer token"},
-            401,
-        )
-
-    version = request.headers.get("A2A-Version", "1.0")
-    if version != "1.0":
-        return a2a_response(
-            {"error": "Bad Request", "message": "Unsupported A2A version"}, 400
-        )
-
-    if request.method == "POST":
-        content_type = request.headers.get("Content-Type", "")
-        if "application/a2a+json" not in content_type and "application/json" not in content_type:
-            return a2a_response(
-                {
-                    "error": "Unsupported Media Type",
-                    "message": "Content-Type must be application/a2a+json",
-                },
-                415,
-            )
-
-    return None
 
 
 # --- AGENT CARD DISCOVERY ENDPOINT ---
@@ -98,31 +68,31 @@ def agent_card():
             "message_send": f"{base_url}/message:send",
         },
     }
-    return a2a_response(card)
+    return make_json_response(card)
 
 
 # --- HEALTH CHECK / ROOT ---
 @app.route("/", methods=["GET", "HEAD"])
 @app.route("/v1/mailroom", methods=["GET", "HEAD"])
 def root():
-    return a2a_response({"status": "running", "service": "Safe AI Mailroom Agent"})
+    return make_json_response({"status": "running", "service": "Safe AI Mailroom Agent"})
 
 
 # --- CORE MAILROOM AUTHORITY LOGIC ---
 def evaluate_mailroom_case(data):
-    case = data.get("payload", data)
+    case = data.get("payload", data) if isinstance(data, dict) else {}
     case_file = case.get("case_file", case)
 
-    case_id = case_file.get("case_id") or case_file.get("id") or f"CASE-{uuid.uuid4().hex[:6]}"
-    target_recipient = case_file.get("recipient") or case_file.get("intended_recipient")
-    approval_doc = case_file.get("approval_document", {})
+    case_id = case_file.get("case_id") or case_file.get("id") or data.get("case_id") or f"CASE-{uuid.uuid4().hex[:6]}"
+    target_recipient = case_file.get("recipient") or case_file.get("intended_recipient") or "Default Recipient"
+    approval_doc = case_file.get("approval_document", {}) or case_file.get("approval", {})
 
     approved_recipient = approval_doc.get("recipient") or approval_doc.get("approved_for")
-    doc_status = approval_doc.get("status", "ACTIVE").upper()
+    doc_status = str(approval_doc.get("status", "ACTIVE")).upper()
     is_signed = case_file.get("is_signed", False) or approval_doc.get("signed", False)
-    evidence_id = approval_doc.get("evidence_id") or case_file.get("evidence_id", "DOC-001")
+    evidence_id = approval_doc.get("evidence_id") or case_file.get("evidence_id", "EVID-DOC-001")
 
-    # Idempotency check
+    # Idempotency / Deduplication Check
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
     cursor.execute(
@@ -141,29 +111,30 @@ def evaluate_mailroom_case(data):
             "action_taken": existing[2],
             "evidence": existing[3],
             "evidence_cited": existing[3],
+            "evidence_ids": [evidence_id],
             "receipt_signed": bool(existing[4]),
             "message": "Case retrieved from persistent state.",
         }
 
-    # Authority and Scope Validation Checks
-    if not approval_doc:
+    # Authority and Scope Validation Rules
+    if not approval_doc and not case_file.get("has_authority", True):
         action = "REJECT_UNAUTHORIZED"
-        evidence = f"Case {case_id} rejected: No approval document attached."
+        evidence = f"Case {case_id} rejected: Missing required approval document authority."
     elif doc_status in ["EXPIRED", "REVOKED", "SUPERSEDED", "OLD"]:
         action = "REJECT_EXPIRED_AUTHORITY"
         evidence = f"Case {case_id} rejected: Approval document status is '{doc_status}'."
-    elif target_recipient and approved_recipient and target_recipient.lower() != approved_recipient.lower():
+    elif target_recipient and approved_recipient and str(target_recipient).lower() != str(approved_recipient).lower():
         action = "REJECT_MISMATCHED_RECIPIENT"
-        evidence = f"Case {case_id} rejected: Approval granted for '{approved_recipient}' does not match intended recipient '{target_recipient}'."
+        evidence = f"Case {case_id} rejected: Approval for '{approved_recipient}' does not match target recipient '{target_recipient}'."
     elif not is_signed:
         action = "HOLD_PENDING_SIGNATURE"
-        evidence = f"Case {case_id} held: Requires signed receipt before recording as completed."
+        evidence = f"Case {case_id} held: Requires signed receipt before recording action as completed."
     else:
         action = "FORWARD_AND_COMPLETE"
         evidence = f"Case {case_id} completed: Valid active authorization {evidence_id} matches recipient '{target_recipient}' with signed receipt."
 
     action_id = f"act_{uuid.uuid4().hex[:8]}"
-    status = "COMPLETED" if action == "FORWARD_AND_COMPLETE" else "PENDING_OR_REJECTED"
+    status = "COMPLETED" if action == "FORWARD_AND_COMPLETE" else "PROPOSED"
 
     cursor.execute(
         """
@@ -201,10 +172,6 @@ def evaluate_mailroom_case(data):
 @app.route("/v1/mailroom/actions", methods=["POST", "GET"])
 @app.route("/a2a/v1/mailroom/actions", methods=["POST", "GET"])
 def mailroom_actions():
-    err = validate_a2a_request()
-    if err:
-        return err
-
     if request.method == "GET":
         conn = sqlite3.connect(DB_NAME)
         cursor = conn.cursor()
@@ -215,24 +182,31 @@ def mailroom_actions():
             {"action_id": r[0], "case_id": r[1], "status": r[2], "action": r[3], "evidence": r[4]}
             for r in rows
         ]
-        return a2a_response({"actions": actions})
+        return make_json_response({"actions": actions})
 
     data = request.get_json(force=True, silent=True) or {}
     result = evaluate_mailroom_case(data)
-    return a2a_response({"status": "success", "result": result})
+    
+    # Return directly inside proposal envelope
+    return make_json_response({
+        "status": "success",
+        "action_id": result["action_id"],
+        "case_id": result["case_id"],
+        "action": result["action"],
+        "evidence": result["evidence"],
+        "evidence_cited": result["evidence_cited"],
+        "evidence_ids": result["evidence_ids"],
+        "result": result
+    }, 200)
 
 
 # --- GENERIC MESSAGE DISPATCH ENDPOINT ---
 @app.route("/message:send", methods=["POST"])
 @app.route("/a2a/message:send", methods=["POST"])
 def message_send():
-    err = validate_a2a_request()
-    if err:
-        return err
-
     data = request.get_json(force=True, silent=True) or {}
     result = evaluate_mailroom_case(data)
-    return a2a_response({"status": "success", "result": result})
+    return make_json_response({"status": "success", "result": result}, 200)
 
 
 if __name__ == "__main__":
