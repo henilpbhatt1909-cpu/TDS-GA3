@@ -12,7 +12,7 @@ def init_db():
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS incident_telemetry (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            incident_id TEXT NOT NULL,
+            incident_id TEXT UNIQUE NOT NULL,
             timestamp TEXT NOT NULL,
             action_taken TEXT NOT NULL,
             scaling_limit_reached BOOLEAN NOT NULL,
@@ -22,12 +22,20 @@ def init_db():
     conn.commit()
     conn.close()
 
+def incident_exists(incident_id: str) -> bool:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute('SELECT 1 FROM incident_telemetry WHERE incident_id = ?', (incident_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row is not None
+
 def save_telemetry(incident_id: str, action_taken: str, scaling_limit_reached: bool, telemetry: dict):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     timestamp = datetime.now(timezone.utc).isoformat()
     cursor.execute(
-        '''INSERT INTO incident_telemetry 
+        '''INSERT OR REPLACE INTO incident_telemetry 
            (incident_id, timestamp, action_taken, scaling_limit_reached, telemetry_data) 
            VALUES (?, ?, ?, ?, ?)''',
         (incident_id, timestamp, action_taken, scaling_limit_reached, json.dumps(telemetry))

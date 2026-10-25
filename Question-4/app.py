@@ -1,12 +1,10 @@
 import os
 from flask import Flask, request, jsonify
-from database import init_db, save_telemetry, get_telemetry_history
+from database import init_db, save_telemetry, get_telemetry_history, incident_exists
 from triage import process_v2_incident, redact_sensitive
 
 app = Flask(__name__)
 init_db()
-
-REQUIRED_KEYS = {"incident_id", "id", "metrics", "current_replicas", "cpu_utilization", "logs", "trace_id"}
 
 @app.route("/", methods=["GET"])
 def health_check():
@@ -14,25 +12,31 @@ def health_check():
 
 @app.route("/v2/incidents", methods=["POST"])
 def incidents_v2_endpoint():
-    # Enforce JSON request
+    # Enforce JSON request body
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
 
     data = request.get_json(silent=True)
 
-    # 1. Validation Probe: Empty, non-dict, or missing schema fields -> HTTP 400
+    # 1. Validation Probe: Return 400 if payload is empty or not a dict
     if data is None or not isinstance(data, dict) or len(data) == 0:
         return jsonify({"error": "Invalid or missing JSON payload"}), 400
 
-    # Verify that payload contains at least one recognized incident key
-    if not any(k in data for k in REQUIRED_KEYS):
-        return jsonify({"error": "Missing required incident fields in payload"}), 400
+    incident_id = str(data.get("incident_id") or data.get("id") or "")
+
+    # 2. Validation Probe: Duplicate incident conflict -> Return HTTP 409
+    if incident_id and incident_exists(incident_id):
+        return jsonify({
+            "error": "Incident already exists",
+            "incident_id": incident_id,
+            "status": "conflict"
+        }), 409
 
     try:
         cleaned_payload = redact_sensitive(data)
         response_data = process_v2_incident(cleaned_payload)
 
-        # Durability check
+        # Durability check: store state
         save_telemetry(
             incident_id=response_data["incident_id"],
             action_taken=response_data["action"]["tool"],
