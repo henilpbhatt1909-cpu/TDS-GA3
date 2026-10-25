@@ -23,6 +23,8 @@ def init_db():
     conn.close()
 
 def incident_exists(incident_id: str) -> bool:
+    if not incident_id:
+        return False
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute('SELECT 1 FROM incident_telemetry WHERE incident_id = ?', (incident_id,))

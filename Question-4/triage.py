@@ -27,18 +27,18 @@ def redact_sensitive(val):
 def process_v2_incident(payload: dict) -> dict:
     clean_payload = redact_sensitive(payload)
 
-    # Trace correlation across calls and attempts
+    # Identifiers & Trace Correlation
     trace_id = str(clean_payload.get("trace_id") or clean_payload.get("correlation_id") or f"trace-{uuid.uuid4().hex}")
     incident_id = str(clean_payload.get("incident_id") or clean_payload.get("id") or f"inc-{uuid.uuid4().hex[:8]}")
 
-    metrics = clean_payload.get("metrics") or clean_payload
+    metrics = clean_payload.get("metrics") if isinstance(clean_payload.get("metrics"), dict) else clean_payload
     current_replicas = int(metrics.get("current_replicas", 1))
     max_replicas = int(metrics.get("max_replicas", 10))
     cpu_utilization = float(metrics.get("cpu_utilization", 0.0))
 
     evidence_ids = clean_payload.get("evidence_ids") or ["ev-cpu-utilization", "ev-replica-limit"]
 
-    # Permitted scaling limit triage rule
+    # Limit Rule Check: When at/above permitted scaling limit -> Page owner
     at_limit = current_replicas >= max_replicas
 
     if at_limit:
@@ -72,7 +72,7 @@ def process_v2_incident(payload: dict) -> dict:
 
     # Span identifiers & trace topology
     call_id = f"call-{uuid.uuid4().hex[:8]}"
-    attempt_id = f"attempt-1"
+    attempt_id = "attempt-1"
     receipt_id = f"rcpt-{uuid.uuid4().hex[:8]}"
     
     root_span_id = f"span-root-{uuid.uuid4().hex[:8]}"

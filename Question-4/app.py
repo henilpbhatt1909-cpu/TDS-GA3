@@ -12,19 +12,19 @@ def health_check():
 
 @app.route("/v2/incidents", methods=["POST"])
 def incidents_v2_endpoint():
-    # Enforce JSON request body
+    # 1. Validation Probe: Return 400 for non-JSON requests
     if not request.is_json:
         return jsonify({"error": "Content-Type must be application/json"}), 400
 
     data = request.get_json(silent=True)
 
-    # 1. Validation Probe: Return 400 if payload is empty or not a dict
+    # 2. Validation Probe: Return 400 for empty or invalid body
     if data is None or not isinstance(data, dict) or len(data) == 0:
         return jsonify({"error": "Invalid or missing JSON payload"}), 400
 
     incident_id = str(data.get("incident_id") or data.get("id") or "")
 
-    # 2. Validation Probe: Duplicate incident conflict -> Return HTTP 409
+    # 3. Validation Probe: Return 409 Conflict if incident was already submitted
     if incident_id and incident_exists(incident_id):
         return jsonify({
             "error": "Incident already exists",
@@ -36,7 +36,7 @@ def incidents_v2_endpoint():
         cleaned_payload = redact_sensitive(data)
         response_data = process_v2_incident(cleaned_payload)
 
-        # Durability check: store state
+        # Persist telemetry state for durability & replay checks
         save_telemetry(
             incident_id=response_data["incident_id"],
             action_taken=response_data["action"]["tool"],
